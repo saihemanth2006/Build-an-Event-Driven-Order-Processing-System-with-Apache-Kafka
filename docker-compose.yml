@@ -1,0 +1,258 @@
+version: "3.8"
+
+# ============================================
+# Event-Driven Order Processing System
+# Docker Compose Configuration
+# ============================================
+
+services:
+  # ============================================
+  # INFRASTRUCTURE SERVICES
+  # ============================================
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_INIT_LIMIT: 5
+    ports:
+      - "2181:2181"
+    networks:
+      - event-driven-network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    ports:
+      - "9092:9092"
+    networks:
+      - event-driven-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-c",
+          "kafka-broker-api-versions.sh --bootstrap-server localhost:9092",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_USER: ${MYSQL_USER:-orderuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-orderpass123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-orderdb}
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - mysql-data:/var/lib/mysql
+    networks:
+      - event-driven-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # APPLICATION SERVICES
+  # ============================================
+
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: order-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      # API Configuration
+      API_PORT: 8000
+      DEBUG: ${DEBUG:-False}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # Database Configuration
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-orderuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-orderpass123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-orderdb}
+
+      # Kafka Configuration
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ORDER_TOPIC: order-events
+      INVENTORY_UPDATE_TOPIC: inventory-events
+      FAILED_ORDERS_TOPIC: failed-orders
+      NOTIFICATION_TOPIC: notification-events
+      DLQ_TOPIC: dlq-events
+
+      # Outbox Configuration
+      OUTBOX_POLL_INTERVAL: 5
+      OUTBOX_BATCH_SIZE: 100
+      MAX_RETRIES: 3
+      RETRY_BACKOFF_BASE: 2.0
+    ports:
+      - "8000:8000"
+    networks:
+      - event-driven-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  inventory-service:
+    build:
+      context: ./inventory-service
+      dockerfile: Dockerfile
+    container_name: inventory-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      # Database Configuration
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-orderuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-orderpass123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-orderdb}
+
+      # Kafka Configuration
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ORDER_TOPIC: order-events
+      INVENTORY_UPDATE_TOPIC: inventory-events
+      FAILED_ORDERS_TOPIC: failed-orders
+      DLQ_TOPIC: dlq-events
+      INVENTORY_CONSUMER_GROUP: inventory-service
+
+      # Consumer Configuration
+      KAFKA_SESSION_TIMEOUT: 30000
+      KAFKA_MAX_POLL_RECORDS: 10
+
+      # Service Configuration
+      DEBUG: ${DEBUG:-False}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MAX_RETRIES: 3
+      RETRY_BACKOFF_BASE: 2.0
+    networks:
+      - event-driven-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      # Database Configuration
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-orderuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-orderpass123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-orderdb}
+
+      # Kafka Configuration
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      ORDER_TOPIC: order-events
+      INVENTORY_UPDATE_TOPIC: inventory-events
+      FAILED_ORDERS_TOPIC: failed-orders
+      DLQ_TOPIC: dlq-events
+      NOTIFICATION_CONSUMER_GROUP: notification-service
+
+      # Consumer Configuration
+      KAFKA_SESSION_TIMEOUT: 30000
+      KAFKA_MAX_POLL_RECORDS: 10
+
+      # Service Configuration
+      DEBUG: ${DEBUG:-False}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MAX_RETRIES: 3
+      RETRY_BACKOFF_BASE: 2.0
+    networks:
+      - event-driven-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+# ============================================
+# NETWORKS
+# ============================================
+
+networks:
+  event-driven-network:
+    driver: bridge
+
+# ============================================
+# VOLUMES
+# ============================================
+
+volumes:
+  mysql-data:
+    driver: local
